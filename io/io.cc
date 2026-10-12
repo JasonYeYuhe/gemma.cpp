@@ -54,6 +54,8 @@
 // FilePosix should only be compiled on non-Windows. It is easier to
 // check this in source code because we support multiple build systems. Note
 // that IOBatch at the end of this TU is still compiled on all platforms.
+#include <errno.h>
+
 #if !HWY_OS_WIN
 
 #if GEMMA_IO_PREADV
@@ -61,19 +63,17 @@
 #ifndef _DEFAULT_SOURCE
 #define _DEFAULT_SOURCE
 #endif
-#include <errno.h>
 #include <sys/uio.h>  // preadv
 #endif                // GEMMA_IO_PREADV
 
 #include <fcntl.h>   // open
 #include <limits.h>  // IOV_MAX
 #include <stdint.h>
-#include <stdio.h>  // SEEK_END - unistd isn't enough for IDE.
 #include <sys/types.h>
 // Old OSX may require sys/types.h before sys/mman.h.
 #include <sys/mman.h>  // mmap
-#include <sys/stat.h>  // O_RDONLY
-#include <unistd.h>    // read, write, close
+#include <sys/stat.h>  // fstat, O_RDONLY
+#include <unistd.h>    // pread, pwrite, close
 
 // Placeholder for internal header, do not modify.
 #include "util/allocator.h"
@@ -81,12 +81,12 @@
 namespace gcpp {
 
 class FilePosix : public File {
-  int fd_ = 0;
+  int fd_ = -1;
 
  public:
-  explicit FilePosix(int fd) : fd_(fd) { HWY_ASSERT(fd > 0); }
+  explicit FilePosix(int fd) : fd_(fd) { HWY_ASSERT(fd >= 0); }
   ~FilePosix() override {
-    if (fd_ != 0) {
+    if (fd_ >= 0) {
       HWY_ASSERT(close(fd_) != -1);
     }
   }
@@ -96,20 +96,23 @@ class FilePosix : public File {
 
   uint64_t FileSize() const override {
     static_assert(sizeof(off_t) == 8, "64-bit off_t required");
-    const off_t size = lseek(fd_, 0, SEEK_END);
-    if (size < 0) {
+    struct stat st;
+    if (fstat(fd_, &st) != 0 || st.st_size < 0) {
       return 0;
     }
-    return static_cast<uint64_t>(size);
+    return static_cast<uint64_t>(st.st_size);
   }
 
   bool Read(uint64_t offset, uint64_t size, void* to) const override {
     uint8_t* bytes = reinterpret_cast<uint8_t*>(to);
     uint64_t pos = 0;
-    for (;;) {
+    while (pos < size) {
       // pread seems to be faster than lseek + read when parallelized.
-      const auto bytes_read = pread(fd_, bytes + pos, size - pos, offset + pos);
+      const size_t want =
+          static_cast<size_t>(HWY_MIN(size - pos, uint64_t{0x7FFFF000}));
+      const ssize_t bytes_read = pread(fd_, bytes + pos, want, offset + pos);
       if (bytes_read <= 0) {
+        if (bytes_read < 0 && errno == EINTR) continue;
         HWY_WARN(
             "Read failure at pos %zu within size %zu with offset %zu and "
             "errno %d\n",
@@ -117,9 +120,8 @@ class FilePosix : public File {
             static_cast<size_t>(offset), errno);
         break;
       }
-      pos += bytes_read;
+      pos += static_cast<uint64_t>(bytes_read);
       HWY_ASSERT(pos <= size);
-      if (pos == size) break;
     }
     return pos == size;  // success if managed to read desired size
   }
@@ -127,10 +129,13 @@ class FilePosix : public File {
   bool Write(const void* from, uint64_t size, uint64_t offset) override {
     const uint8_t* bytes = reinterpret_cast<const uint8_t*>(from);
     uint64_t pos = 0;
-    for (;;) {
-      const auto bytes_written =
-          pwrite(fd_, bytes + pos, size - pos, offset + pos);
+    while (pos < size) {
+      const size_t want =
+          static_cast<size_t>(HWY_MIN(size - pos, uint64_t{0x7FFFF000}));
+      const ssize_t bytes_written =
+          pwrite(fd_, bytes + pos, want, offset + pos);
       if (bytes_written <= 0) {
+        if (bytes_written < 0 && errno == EINTR) continue;
         HWY_WARN(
             "Write failure at pos %zu within size %zu with offset %zu and "
             "errno %d\n",
@@ -138,9 +143,8 @@ class FilePosix : public File {
             static_cast<size_t>(offset), errno);
         break;
       }
-      pos += bytes_written;
+      pos += static_cast<uint64_t>(bytes_written);
       HWY_ASSERT(pos <= size);
-      if (pos == size) break;
     }
     return pos == size;  // success if managed to write desired size
   }
@@ -179,7 +183,10 @@ std::unique_ptr<File> OpenFileOrNull(const Path& filename, const char* mode) {
 
   const bool is_read = mode[0] != 'w';
   const int flags = is_read ? O_RDONLY : O_CREAT | O_RDWR | O_TRUNC;
-  const int fd = open(filename.path.c_str(), flags, 0644);
+  int fd;
+  do {
+    fd = open(filename.path.c_str(), flags, 0644);
+  } while (fd < 0 && errno == EINTR);
   if (fd < 0) return file;
 
 #if GEMMA_IO_FADVISE

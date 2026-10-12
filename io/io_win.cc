@@ -51,10 +51,9 @@ class FileWin : public File {
   bool IsAppendOnly() const override { return false; }
 
   uint64_t FileSize() const override {
-    DWORD hi;
-    const DWORD lo = GetFileSize(hFile_, &hi);
-    if (lo == INVALID_FILE_SIZE) return 0;
-    return (static_cast<uint64_t>(hi) << 32) | lo;
+    LARGE_INTEGER size;
+    if (!GetFileSizeEx(hFile_, &size) || size.QuadPart < 0) return 0;
+    return static_cast<uint64_t>(size.QuadPart);
   }
 
   bool Read(uint64_t offset, uint64_t size, void* to) const override {
@@ -66,11 +65,9 @@ class FileWin : public File {
       overlapped.OffsetHigh = (offset >> 32) & 0xFFFFFFFF;
       const DWORD want =
           static_cast<DWORD>(HWY_MIN(size, uint64_t{0xFFFFFFFF}));
-      DWORD got;
-      if (!ReadFile(hFile_, bytes, want, &got, &overlapped)) {
-        if (GetLastError() != ERROR_HANDLE_EOF) {
-          return false;
-        }
+      DWORD got = 0;
+      if (!ReadFile(hFile_, bytes, want, &got, &overlapped) || got == 0) {
+        return false;
       }
       offset += got;
       bytes += got;
@@ -88,11 +85,9 @@ class FileWin : public File {
       overlapped.OffsetHigh = (offset >> 32) & 0xFFFFFFFF;
       const DWORD want =
           static_cast<DWORD>(HWY_MIN(size, uint64_t{0xFFFFFFFF}));
-      DWORD got;
-      if (!WriteFile(hFile_, bytes, want, &got, &overlapped)) {
-        if (GetLastError() != ERROR_HANDLE_EOF) {
-          return false;
-        }
+      DWORD got = 0;
+      if (!WriteFile(hFile_, bytes, want, &got, &overlapped) || got == 0) {
+        return false;
       }
       offset += got;
       bytes += got;
@@ -107,9 +102,13 @@ class FileWin : public File {
     // Size=0 means the entire file.
     HANDLE hMapping =
         CreateFileMappingA(hFile_, nullptr, PAGE_READONLY, 0, 0, nullptr);
+    if (hMapping == nullptr) return MapPtr();
     // Offset zero and size=0 means the entire file.
     void* ptr = MapViewOfFile(hMapping, FILE_MAP_READ, 0, 0, 0);
-    if (!ptr) return MapPtr();
+    if (!ptr) {
+      HWY_ASSERT(CloseHandle(hMapping));
+      return MapPtr();
+    }
     return MapPtr(static_cast<const uint8_t*>(ptr),
                   DeleterFunc([hMapping](void* ptr) {
                     HWY_ASSERT(UnmapViewOfFile(ptr));
@@ -122,8 +121,11 @@ std::unique_ptr<File> OpenFileOrNull(const Path& filename, const char* mode) {
   const bool is_read = mode[0] != 'w';
   const DWORD flags =
       FILE_ATTRIBUTE_NORMAL | (is_read ? FILE_FLAG_SEQUENTIAL_SCAN : 0);
-  const DWORD access = is_read ? GENERIC_READ : GENERIC_WRITE;
-  const DWORD share = is_read ? FILE_SHARE_READ : 0;
+  const DWORD access =
+      is_read ? GENERIC_READ : (GENERIC_READ | GENERIC_WRITE);
+  const DWORD share =
+      is_read ? FILE_SHARE_READ
+              : (FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
   const DWORD create = is_read ? OPEN_EXISTING : CREATE_ALWAYS;
   const HANDLE hFile = CreateFileA(filename.path.c_str(), access, share,
                                    nullptr, create, flags, nullptr);
